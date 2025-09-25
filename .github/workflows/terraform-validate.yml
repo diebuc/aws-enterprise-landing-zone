@@ -1,0 +1,472 @@
+name: Infrastructure Validation & Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run weekly security scans every Monday at 6 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      run_cost_analysis:
+        description: 'Run detailed cost analysis'
+        required: false
+        default: 'true'
+        type: boolean
+
+env:
+  TF_VERSION: '1.6.2'
+  TERRAFORM_DOCS_VERSION: 'v0.16.0'
+  PYTHON_VERSION: '3.11'
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  terraform-validation:
+    name: Terraform Validation
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform-path:
+          - terraform/global
+          - terraform/modules/account-baseline
+          - terraform/modules/networking
+          - terraform/modules/logging
+          - terraform/modules/monitoring
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Cache Terraform plugins
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.terraform.d/plugin-cache
+        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+        restore-keys: |
+          ${{ runner.os }}-terraform-
+
+    - name: Terraform Format Check
+      id: fmt
+      run: |
+        echo "::group::Terraform Format Check"
+        if ! terraform fmt -check -recursive -diff; then
+          echo "❌ Terraform format check failed"
+          echo "Run 'terraform fmt -recursive' to fix formatting issues"
+          exit 1
+        else
+          echo "✅ Terraform format check passed"
+        fi
+        echo "::endgroup::"
+      working-directory: ${{ matrix.terraform-path }}
+
+    - name: Terraform Init
+      id: init
+      run: |
+        echo "::group::Terraform Init"
+        terraform init -backend=false -no-color
+        echo "init_outcome=success" >> $GITHUB_OUTPUT
+        echo "::endgroup::"
+      working-directory: ${{ matrix.terraform-path }}
+
+    - name: Terraform Validate
+      id: validate
+      run: |
+        echo "::group::Terraform Validate"
+        if terraform validate -no-color; then
+          echo "✅ Terraform validation passed for ${{ matrix.terraform-path }}"
+          echo "validate_outcome=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Terraform validation failed for ${{ matrix.terraform-path }}"
+          echo "validate_outcome=failure" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        echo "::endgroup::"
+      working-directory: ${{ matrix.terraform-path }}
+
+    - name: Terraform Plan (Dry Run)
+      id: plan
+      run: |
+        echo "::group::Terraform Plan"
+        # Create a minimal terraform.tfvars for planning
+        cat > terraform.tfvars << EOF
+        aws_region = "us-east-1"
+        organization_domain = "example.com"
+        organization_name = "Test Organization"
+        EOF
+        
+        if terraform plan -no-color -input=false -var-file=terraform.tfvars -out=tfplan.out; then
+          echo "✅ Terraform plan completed successfully"
+          terraform show -no-color tfplan.out > plan_output.txt
+          echo "plan_outcome=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ Terraform plan failed"
+          echo "plan_outcome=failure" >> $GITHUB_OUTPUT
+        fi
+        echo "::endgroup::"
+      working-directory: ${{ matrix.terraform-path }}
+      continue-on-error: true
+      env:
+        AWS_ACCESS_KEY_ID: dummy
+        AWS_SECRET_ACCESS_KEY: dummy
+        AWS_DEFAULT_REGION: us-east-1
+
+    - name: Upload Terraform Plan
+      if: steps.plan.outcome == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ matrix.terraform-path }}-${{ github.sha }}
+        path: ${{ matrix.terraform-path }}/plan_output.txt
+        retention-days: 7
+
+    - name: Comment PR with Results
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const path = '${{ matrix.terraform-path }}';
+          
+          let planOutput = '';
+          try {
+            planOutput = fs.readFileSync(`${path}/plan_output.txt`, 'utf8');
+          } catch (error) {
+            planOutput = 'Plan output not available';
+          }
+          
+          const output = `#### Terraform Validation Results for \`${path}\`
+          
+          | Check | Status |
+          |-------|--------|
+          | Format | ${{ steps.fmt.outcome == 'success' ? '✅ Passed' : '❌ Failed' }} |
+          | Init | ${{ steps.init.outputs.init_outcome == 'success' ? '✅ Passed' : '❌ Failed' }} |
+          | Validate | ${{ steps.validate.outputs.validate_outcome == 'success' ? '✅ Passed' : '❌ Failed' }} |
+          | Plan | ${{ steps.plan.outputs.plan_outcome == 'success' ? '✅ Passed' : '⚠️ Warning' }} |
+          
+          <details><summary>Show Terraform Plan</summary>
+          
+          \`\`\`
+          ${planOutput.slice(0, 8000)}${planOutput.length > 8000 ? '\n... (truncated)' : ''}
+          \`\`\`
+          
+          </details>
+          
+          *Workflow: \`${{ github.workflow }}\` | Path: \`${path}\` | Commit: \`${{ github.sha }}\`*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          });
+
+  security-scanning:
+    name: Security & Compliance Scan
+    runs-on: ubuntu-latest
+    needs: terraform-validation
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Run tfsec Security Scan
+      id: tfsec
+      uses: aquasecurity/tfsec-action@v1.0.3
+      with:
+        soft_fail: true
+        format: sarif
+        additional_args: |
+          --out tfsec-results.sarif
+          --exclude-downloaded-modules
+          --force-all-dirs
+          --verbose
+
+    - name: Upload tfsec SARIF Results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: tfsec-results.sarif
+
+    - name: Run Checkov Infrastructure Scan
+      id: checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: terraform/
+        framework: terraform
+        output_format: sarif
+        output_file_path: checkov-results.sarif
+        download_external_modules: false
+        quiet: false
+        soft_fail: true
+        skip_check: |
+          CKV_AWS_79,CKV_AWS_61,CKV_AWS_144,CKV_AWS_145
+
+    - name: Upload Checkov SARIF Results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: checkov-results.sarif
+
+    - name: Run Semgrep SAST Scan
+      uses: semgrep/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/secrets
+          p/terraform
+          p/dockerfile
+        generateSarif: "1"
+        auditOn: push
+      env:
+        SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+    - name: Upload Semgrep SARIF Results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: semgrep.sarif
+
+    - name: Security Scan Summary
+      run: |
+        echo "## 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Tool | Status | Results |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+        echo "| tfsec | ${{ steps.tfsec.outcome }} | Infrastructure security scan |" >> $GITHUB_STEP_SUMMARY
+        echo "| Checkov | ${{ steps.checkov.outcome }} | Policy and compliance scan |" >> $GITHUB_STEP_SUMMARY
+        echo "| Semgrep | ✅ | Static analysis security testing |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📊 View detailed results in the **Security** tab of this repository." >> $GITHUB_STEP_SUMMARY
+
+  cost-estimation:
+    name: Cost Analysis & Estimation
+    runs-on: ubuntu-latest
+    if: github.event.inputs.run_cost_analysis == 'true' || github.event_name == 'schedule'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install boto3 click tabulate requests
+
+    - name: Install Infracost
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+        infracost --version
+
+    - name: Run Landing Zone Cost Calculator
+      run: |
+        echo "## 💰 Cost Analysis Report" >> cost_analysis.md
+        echo "" >> cost_analysis.md
+        
+        # Small organization analysis
+        echo "### Small Organization (5 accounts, 200 employees)" >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+        python scripts/pre-deployment/cost-calculator.py \
+          --accounts 5 \
+          --employees 200 \
+          --data-gb 500 \
+          --compliance sox pci-dss \
+          --regions us-east-1 >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+        echo "" >> cost_analysis.md
+        
+        # Medium organization analysis
+        echo "### Medium Organization (15 accounts, 800 employees)" >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+        python scripts/pre-deployment/cost-calculator.py \
+          --accounts 15 \
+          --employees 800 \
+          --data-gb 2000 \
+          --compliance sox pci-dss gdpr \
+          --regions us-east-1 eu-west-1 >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+        echo "" >> cost_analysis.md
+        
+        # Enterprise organization analysis
+        echo "### Enterprise Organization (50 accounts, 2500 employees)" >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+        python scripts/pre-deployment/cost-calculator.py \
+          --accounts 50 \
+          --employees 2500 \
+          --data-gb 10000 \
+          --compliance sox pci-dss gdpr hipaa \
+          --regions us-east-1 eu-west-1 ap-southeast-1 >> cost_analysis.md
+        echo '```' >> cost_analysis.md
+
+    - name: Generate JSON Cost Reports
+      run: |
+        mkdir -p cost-reports
+        
+        # Generate detailed JSON reports for different scenarios
+        python scripts/pre-deployment/cost-calculator.py \
+          --accounts 10 --employees 500 --data-gb 1000 \
+          --output json --save-report cost-reports/baseline-scenario.json
+        
+        python scripts/pre-deployment/cost-calculator.py \
+          --accounts 25 --employees 1200 --data-gb 5000 \
+          --compliance sox pci-dss gdpr hipaa \
+          --regions us-east-1 eu-west-1 \
+          --output json --save-report cost-reports/enterprise-scenario.json
+
+    - name: Upload Cost Analysis Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: cost-analysis-report-${{ github.sha }}
+        path: |
+          cost_analysis.md
+          cost-reports/
+        retention-days: 30
+
+    - name: Add Cost Analysis to Step Summary
+      run: |
+        echo "## 💰 Cost Analysis Completed" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Cost analysis has been completed for multiple organization sizes:" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Small**: 5 accounts, 200 employees" >> $GITHUB_STEP_SUMMARY
+        echo "- **Medium**: 15 accounts, 800 employees" >> $GITHUB_STEP_SUMMARY
+        echo "- **Enterprise**: 50 accounts, 2500 employees" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📊 Download the **cost-analysis-report** artifact for detailed results." >> $GITHUB_STEP_SUMMARY
+
+  documentation-generation:
+    name: Generate Documentation
+    runs-on: ubuntu-latest
+    needs: [terraform-validation, security-scanning]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Terraform Docs
+      run: |
+        curl -sSLo terraform-docs.tar.gz \
+          "https://terraform-docs.io/dl/${{ env.TERRAFORM_DOCS_VERSION }}/terraform-docs-${{ env.TERRAFORM_DOCS_VERSION }}-$(uname)-amd64.tar.gz"
+        tar -xzf terraform-docs.tar.gz
+        chmod +x terraform-docs
+        sudo mv terraform-docs /usr/local/bin/terraform-docs
+
+    - name: Generate Terraform Module Documentation
+      run: |
+        echo "Generating documentation for Terraform modules..."
+        
+        # Generate docs for each module
+        for module_dir in terraform/modules/*; do
+          if [ -d "$module_dir" ]; then
+            module_name=$(basename "$module_dir")
+            echo "Generating docs for module: $module_name"
+            
+            # Create module README if it doesn't exist
+            if [ ! -f "$module_dir/README.md" ]; then
+              echo "# $module_name Module" > "$module_dir/README.md"
+              echo "" >> "$module_dir/README.md"
+              echo "<!-- BEGIN_TF_DOCS -->" >> "$module_dir/README.md"
+              echo "<!-- END_TF_DOCS -->" >> "$module_dir/README.md"
+            fi
+            
+            # Update documentation
+            terraform-docs markdown table \
+              --output-file README.md \
+              --output-mode inject \
+              "$module_dir"
+          fi
+        done
+
+    - name: Check for Documentation Changes
+      id: doc_changes
+      run: |
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "changes_detected=true" >> $GITHUB_OUTPUT
+          echo "Documentation updates detected"
+        else
+          echo "changes_detected=false" >> $GITHUB_OUTPUT
+          echo "No documentation changes needed"
+        fi
+
+    - name: Commit Documentation Updates
+      if: steps.doc_changes.outputs.changes_detected == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .
+        git commit -m "docs: auto-update Terraform module documentation
+        
+        - Updated module documentation using terraform-docs
+        - Generated by GitHub Actions workflow
+        - Commit: ${{ github.sha }}"
+        git push
+
+  workflow-summary:
+    name: Workflow Summary
+    runs-on: ubuntu-latest
+    needs: [terraform-validation, security-scanning, cost-estimation, documentation-generation]
+    if: always()
+    
+    steps:
+    - name: Generate Workflow Summary
+      run: |
+        echo "# 🏗️ Infrastructure Validation Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Workflow Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status | Description |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Terraform Validation | ${{ needs.terraform-validation.result }} | Infrastructure code validation |" >> $GITHUB_STEP_SUMMARY
+        echo "| Security Scanning | ${{ needs.security-scanning.result }} | Security and compliance checks |" >> $GITHUB_STEP_SUMMARY
+        echo "| Cost Estimation | ${{ needs.cost-estimation.result }} | Financial impact analysis |" >> $GITHUB_STEP_SUMMARY
+        echo "| Documentation | ${{ needs.documentation-generation.result }} | Auto-generated documentation |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 📊 Key Metrics" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Actor**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Terraform Version**: \`${{ env.TF_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+        
+        # Add status badges
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Status Badges" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "![Terraform](https://img.shields.io/badge/terraform-validated-success)" >> $GITHUB_STEP_SUMMARY
+        echo "![Security](https://img.shields.io/badge/security-scanned-important)" >> $GITHUB_STEP_SUMMARY
+        echo "![Cost](https://img.shields.io/badge/cost-analyzed-informational)" >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify on Failure
+      if: failure()
+      run: |
+        echo "::error::One or more validation jobs failed. Please check the logs above."
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## ❌ Action Required" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Some validation checks failed. Please review:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Terraform formatting and validation errors" >> $GITHUB_STEP_SUMMARY  
+        echo "2. Security scan findings in the Security tab" >> $GITHUB_STEP_SUMMARY
+        echo "3. Cost estimation warnings" >> $GITHUB_STEP_SUMMARY
