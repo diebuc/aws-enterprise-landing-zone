@@ -1,0 +1,204 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceDataResidency",
+      "Effect": "Deny",
+      "Action": [
+        "s3:CreateBucket",
+        "rds:CreateDBInstance",
+        "dynamodb:CreateTable"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "eu-west-1",
+            "eu-central-1"
+          ]
+        },
+        "StringEquals": {
+          "aws:PrincipalTag/DataClassification": "PII"
+        }
+      }
+    },
+    {
+      "Sid": "RequireEncryptionAtRest",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutObject",
+        "dynamodb:CreateTable",
+        "kinesis:CreateStream",
+        "sqs:CreateQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": [
+            "AES256",
+            "aws:kms"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "RequireEncryptionInTransit",
+      "Effect": "Deny",
+      "Action": [
+        "s3:*",
+        "elasticloadbalancing:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    },
+    {
+      "Sid": "EnforceBackupRetention",
+      "Effect": "Deny",
+      "Action": [
+        "backup:DeleteRecoveryPoint",
+        "backup:DeleteBackupVault"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "NumericLessThan": {
+          "backup:CopyJobRetentionDays": "2555"
+        }
+      }
+    },
+    {
+      "Sid": "RequireVPCEndpointsForSensitiveServices",
+      "Effect": "Deny",
+      "Action": [
+        "s3:*",
+        "dynamodb:*",
+        "sqs:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:SourceVpce": [
+            "vpce-*"
+          ]
+        },
+        "StringEquals": {
+          "aws:PrincipalTag/DataClassification": [
+            "Confidential",
+            "Restricted"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyPublicAMISharing",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:ModifyImageAttribute"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ImagePublic": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyPublicEBSSnapshotSharing",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:ModifySnapshotAttribute"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:Add/group": "all"
+        }
+      }
+    },
+    {
+      "Sid": "DenyPublicRDSSnapshotSharing",
+      "Effect": "Deny",
+      "Action": [
+        "rds:ModifyDBSnapshotAttribute",
+        "rds:ModifyDBClusterSnapshotAttribute"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "rds:Add/group": "all"
+        }
+      }
+    },
+    {
+      "Sid": "RequireCloudTrailForAuditAccounts",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:StopLogging",
+        "cloudtrail:PutEventSelectors"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalTag/AccountType": "Audit"
+        }
+      }
+    },
+    {
+      "Sid": "DenyChangesToComplianceRoles",
+      "Effect": "Deny",
+      "Action": [
+        "iam:DeleteRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/*Compliance*",
+        "arn:aws:iam::*:role/*Audit*"
+      ]
+    },
+    {
+      "Sid": "RequireTagsForResourceCreation",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances",
+        "rds:CreateDBInstance",
+        "s3:CreateBucket",
+        "dynamodb:CreateTable"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/Environment": "true",
+          "aws:RequestTag/Owner": "true",
+          "aws:RequestTag/CostCenter": "true",
+          "aws:RequestTag/DataClassification": "true"
+        }
+      }
+    },
+    {
+      "Sid": "RequireApprovalForProductionChanges",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:TerminateInstances",
+        "rds:DeleteDBInstance",
+        "s3:DeleteBucket",
+        "lambda:DeleteFunction"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Environment": "production"
+        },
+        "StringNotEquals": {
+          "aws:PrincipalTag/ChangeApprovalLevel": "Senior"
+        }
+      }
+    }
+  ]
+}

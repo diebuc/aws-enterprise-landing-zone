@@ -1,0 +1,132 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RestrictRegions",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*",
+        "organizations:*",
+        "route53:*",
+        "budgets:*",
+        "cloudfront:*",
+        "support:*",
+        "sts:*",
+        "health:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": [
+            "us-east-1",
+            "us-west-2",
+            "eu-west-1"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyExpensiveEC2Instances",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "ForAnyValue:StringLike": {
+          "ec2:InstanceType": [
+            "*.metal",
+            "*.16xlarge",
+            "*.24xlarge",
+            "*.32xlarge",
+            "p3.*",
+            "p4.*",
+            "g4dn.*",
+            "x1.*",
+            "x2.*",
+            "z1d.*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyExpensiveRDSInstances",
+      "Effect": "Deny",
+      "Action": [
+        "rds:CreateDBInstance",
+        "rds:CreateDBCluster"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringLike": {
+          "rds:DatabaseClass": [
+            "*.16xlarge",
+            "*.24xlarge",
+            "*.32xlarge",
+            "db.x1.*",
+            "db.x2.*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "PreventReservedInstanceModifications",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:ModifyReservedInstances",
+        "rds:ModifyReservedDBInstances"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyNATGatewayCreation",
+      "Effect": "Deny",
+      "Action": "ec2:CreateNatGateway",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalOrgID": "${var.org_id}"
+        }
+      }
+    },
+    {
+      "Sid": "LimitEBSVolumeSizes",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:volume/*",
+      "Condition": {
+        "NumericGreaterThan": {
+          "ec2:VolumeSize": "1000"
+        }
+      }
+    },
+    {
+      "Sid": "PreventSpotInstanceInterruption",
+      "Effect": "Deny",
+      "Action": "ec2:CancelSpotInstanceRequests",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyUntaggedResourceCreation",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:RunInstances",
+        "rds:CreateDBInstance",
+        "s3:CreateBucket"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CostCenter": "true"
+        }
+      }
+    },
+    {
+      "Sid": "RequireBudgetAlerts",
+      "Effect": "Deny",
+      "Action": [
+        "budgets:DeleteBudget",
+        "budgets:ModifyBudget"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
