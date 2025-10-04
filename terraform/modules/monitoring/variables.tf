@@ -68,3 +68,15 @@ variable "alert_thresholds" {
     unauthorized_api_calls = 5
   }
 }
+
+variable "cost_alert_email_addresses" {
+  description = "Email addresses for cost and budget alerts"
+  type        = list(string)
+  default     = []
+}
+
+variable "monitored_account_ids" {
+  description = "List of AWS account IDs to monitor for cost"
+  type        = list(string)
+  default     = []
+}
